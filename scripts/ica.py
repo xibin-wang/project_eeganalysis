@@ -48,8 +48,6 @@ def run_ica(
         reject_by_annotation=True,
     )
 
-    ica.save(path_data/ f"{p_id}_ica.fif", overwrite=True)
-
     return raw_ica, ica
 
 def ica_eval(
@@ -128,37 +126,35 @@ def analysis_individual(filter_config, ica_config, p_id, folder_data, path_resul
     data_before_ica = ica_preparation(data, p_id=p_id, path_data=path_data, path_result=path_result)
 
     # ------------------------- Run ICA -----------------------------------
-    count_ica = 1
     while True:
         data_ica, ica = run_ica(data_before_ica, ica_config, p_id=p_id, path_data=path_data)
         if_re_run, ica_exclude = ica_eval(data_ica, ica, ica_config, p_id=p_id, path_result=path_result)
-        if if_re_run:
-            decision = input("Would you like to decide to run the ICA? "
-                             "This will bring you back to artifact detection window and rerun ica (y/n): ")
-            if decision.lower() == "y":
-                count_ica += 1
-                data_before_ica = mne.io.read_raw_fif(path_data / f"{p_id}_task_Flanker_eeg_before_ica.fif",
-                                                      preload=True)
-                data_before_ica.plot(
-                    duration=10.0,
-                    start=0.0,
-                    n_channels=30,
-                    scalings="auto",
-                    show=True,
-                    block=True,
-                    title="Manual artifact review for ICA",
-                )
-                data_before_ica.save(path_data / f"{p_id}_task_Flanker_eeg_before_ica.fif")
-
-                data_ica, ica = run_ica(data_before_ica, ica_config, p_id=p_id, path_data=path_data)
-                if_re_run, ica_exclude = ica_eval(data_ica, ica, ica_config, p_id=p_id,
-                                                  path_result=path_result)
-                ica.save(path_data / f"{p_id}_task_Flanker_eeg_ica.fif")
-            elif decision.lower() == "n":
-                print("Using current data to continue following analysis.")
-                break
-        elif ~if_re_run:
+        if not if_re_run:
             break
+
+        decision = input("Would you like to decide to run the ICA? "
+                         "This will bring you back to artifact detection window and rerun ica (y/n): ").strip().lower()
+        if decision.lower() == "n":
+            print("Using current data to continue following analysis.")
+            break
+        elif decision.lower() == "y":
+            data_before_ica.plot(
+                block=True,
+                scalings="auto",
+                title="Manual artifact review for ICA",
+            )
+            continue
+        else:
+            print("Please enter y or n.")
+
+    data_before_ica.save(
+        path_data / f"{p_id}_task_Flanker_eeg_before_ica.fif",
+        overwrite=True,
+    )
+    ica.save(
+        path_data / f"{p_id}_ica.fif",
+        overwrite=True,
+    )
 
     return data_before_ica, data_ica, ica
 

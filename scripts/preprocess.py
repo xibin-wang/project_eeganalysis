@@ -55,6 +55,11 @@ def has_line_noise(
         eeg=True
     )
 
+    if window_sec <= 0 or step_sec <= 0:
+        raise ValueError("window_sec and step_sec must bigger than 0.")
+    if not 0 < min_fraction <= 1:
+        raise ValueError("min_fraction must in (0, 1].")
+
     win = int(sample_rate * window_sec)
     step = int(sample_rate * step_sec)
 
@@ -80,8 +85,8 @@ def has_line_noise(
         )
 
         line_band = (
-            (freqs >= min_fraction - 0.5) &
-            (freqs <= min_fraction + 0.5)
+            (freqs >= line_freq - 0.5) &
+            (freqs <= line_freq + 0.5)
         )
 
         background = (
@@ -94,7 +99,10 @@ def has_line_noise(
         peak = np.max(psd[:, line_band], axis=1)
         noise = np.median(psd[:, background], axis=1)
 
-        ratio_db = 10 * np.log10(peak + 1e-30 / noise + 1e-30)
+        eps = np.finfo(float).tiny
+        ratio_db = 10 * np.log10(
+            (peak + eps) / (noise + eps)
+        )
 
         results.append(ratio_db > threshold_db)
 
@@ -113,15 +121,15 @@ def power_filter(
     data_filtered = raw_data.copy()
 
     data_filtered.filter(
-        l_freq=config.lowpass_freq,
-        h_freq=config.highpass_freq,
+        l_freq=config.highpass_freq,
+        h_freq=config.lowpass_freq,
         picks="eeg",
         method="fir",
         phase="zero",
         fir_design="firwin",
         verbose=True
     )
-    print(f"Data filtered to {config.lowpass_freq}Hz and {config.highpass_freq}Hz.")
+    print(f"Data filtered to {config.highpass_freq}Hz and {config.lowpass_freq}Hz.")
 
     if config.highpass_freq > config.line_freq + 5:
         if has_line_noise(

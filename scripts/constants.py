@@ -15,8 +15,8 @@ class PathConstants:
 class FilterParameters:
     # --------- Band pass parameters --------------
     line_freq: float=50.0
-    lowpass_freq: float=0.1
-    highpass_freq: float=80.0
+    lowpass_freq: float=80
+    highpass_freq: float=0.1
     # --------- Power line noise detection parameters --------
     threshold_db: int=8
     min_fraction: float=0.2

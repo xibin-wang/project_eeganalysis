@@ -9,6 +9,8 @@
 
 # Ignore all __pycache__ directories inside scripts recursively
 /scripts/**/__pycache__/
+/scripts/test.py
 
 # Track the .gitignore file itself
 !/.gitignore
+!/README.md

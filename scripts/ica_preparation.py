@@ -31,6 +31,7 @@ All interval times are relative to the beginning of Raw.
 
 from collections import Counter
 from pathlib import Path
+from collections.abc import Mapping
 
 import numpy as np
 import pandas as pd
@@ -1090,10 +1091,14 @@ def get_response_times(raw):
 
     # Boolean mask aligned with annotations
     response_mask = np.array([
-        isinstance(extra, dict)
-        and str(extra.get("Event", "")).strip().lower() == "response"
+        isinstance(extra, Mapping)
+        and str(extra.get("Event", "")).strip().casefold() == "response"
         for extra in annotations.extras
     ], dtype=bool)
+    if not response_mask.any():
+        raise ValueError(
+            "No event value found, please check _event.tsv file."
+        )
 
     # Annotation onsets are stored in the Raw annotation
     # time coordinate; convert to current Raw-relative time.

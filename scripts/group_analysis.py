@@ -29,7 +29,7 @@ def compute_roi_erps(
             diff_df["Congruency"].astype(float),
         )
     )
-    erp_data = { }
+    erp_data = {}
 
     participants = trial_df["participant"].astype(str).to_numpy()
     congruency = trial_df["Congruency"].to_numpy(dtype=float)
@@ -53,22 +53,21 @@ def compute_roi_erps(
                 continue
 
             # Mean ERP per participant and condition
-            erp_data[(cong, 1)].append(
+            erp_lists[(cong, 1)].append(
                 erp_trials[mask_correct].mean(axis=0)
             )
-            erp_data[(cong, 0)].append(
+            erp_lists[(cong, 0)].append(
                 erp_trials[mask_error].mean(axis=0)
             )
 
-    for key, waves in erp_lists.items():
-        if len(waves) > 0:
-            erp_data[key] = np.stack(waves, axis=0)
-        else:
-            erp_data[key] = np.empty(
-                (0, erp_trials.shape[1]),
-                dtype=float,
-            )
-
+    erp_data = {
+        key: (
+            np.stack(waves, axis=0)
+            if waves
+            else np.empty((0, erp_trials.shape[1]), dtype=float)
+        )
+        for key, waves in erp_lists.items()
+    }
     return erp_data
 
 def plot_roi_erps(
@@ -151,11 +150,18 @@ def read_roi_based(group_config, participant_info, folder_data) -> tuple[pd.Data
             path_data,
             preload=True,
         )
+
+        missing_roi = set(group_config.roi_channels) - set(epochs.ch_names)
+        bad_roi = set(group_config.roi_channels) & set(epochs.info["bads"])
+
+        if missing_roi or bad_roi:
+            raise ValueError(
+                f"{participant_id}: missing ROI={missing_roi}, bad ROI={bad_roi}"
+            )
+
         data = epochs.get_data(
             picks=group_config.roi_channels,
-            tmin=group_config.win_analysis_s[0],
-            tmax=group_config.win_analysis_s[1],
-            units="uV"
+            units="uV",
         )
 
         roi_waveforms = data.mean(axis=1)
@@ -164,6 +170,8 @@ def read_roi_based(group_config, participant_info, folder_data) -> tuple[pd.Data
             (epochs.times >= tmin - 1e-9)
             & (epochs.times <= tmax + 1e-9)
         )
+        if not time_mask.any():
+            raise ValueError("No valid samples between analysis window.")
 
         amplitude = roi_waveforms[:, time_mask].mean(axis=1)
 
@@ -184,10 +192,11 @@ def read_roi_based(group_config, participant_info, folder_data) -> tuple[pd.Data
         current_times = epochs.times * 1000
         if times_ms is None:
             times_ms = current_times.copy()
-        elif not np.allclose(times_ms, current_times):
-            raise ValueError(
-                f"Inconsistent time axis: {participant_id}"
-            )
+        elif (
+                times_ms.shape != current_times.shape
+                or not np.allclose(times_ms, current_times)
+        ):
+            raise ValueError(f"Inconsistent time axis: {participant_id}")
 
     trial_df = pd.concat(
         trial_data,
@@ -221,7 +230,7 @@ def roi_based_analysis(participant_info, data_roi_df, erp_trials, times_ms, path
     )
 
     diff_df = (
-        (means[1] - means[0])
+        (means[0] - means[1])
         .rename("ACC_diff")
         .reset_index()
     )
@@ -269,10 +278,7 @@ def roi_based_analysis(participant_info, data_roi_df, erp_trials, times_ms, path
         "CI_upper": result.conf_int().loc[fe_names, 1].values,
     })
 
-    result.save(
-        path_result/"LMM_model.pickle",
-        overwrite=True,
-    )
+    result.save(path_result/"LMM_model.pickle")
     result_df.to_csv(
         path_result/"LMM_results.tsv",
         sep="\t",
