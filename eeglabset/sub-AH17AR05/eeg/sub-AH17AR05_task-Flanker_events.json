@@ -1,0 +1,80 @@
+{
+  "onset": {
+    "LongName": "Event onset",
+    "Description": "Onset (in seconds) of the event measured from the beginning of the acquisition of the first volume in the corresponding task imaging data file.",
+    "Units": "Sampling Points"
+  },
+  "duration": {
+    "LongName": "Event duration",
+    "Description": "Duration of the event (measured from onset) in seconds",
+    "Units": "second"
+  },
+  "sample": {
+    "LongName": "Sample",
+    "Description": "Onset of the event according to the sampling scheme of the recorded modality (i.e., referring to the raw data file that the events.tsv file accompanies)."
+  },
+  "trial_type": {
+    "LongName": "Event categorization",
+    "Description": "Complete categorisation of each trial to identify them as instances of the experimental conditions."
+  },
+  "value": {
+    "LongName": "Event marker",
+    "Description": "Marker value associated with the event.",
+    "Levels": {
+      "x100": "Flanker_0%_Congruency",
+      "x110": "Flanker_33%_Congruency",
+      "x120": "Flanker_66%_Congruency",
+      "x130": "Flanker_100%_Congruency",
+      "x104": "Target_0%_Congruency",
+      "x114": "Target_33%_Congruency",
+      "x124": "Target_66%_Congruency",
+      "x134": "Target_100%_Congruency",
+      "x106": "Response_Correct_slow_0%_Congruency",
+      "x116": "Response_Correct_slow_33%_Congruency",
+      "x126": "Response_Correct_slow_66%_Congruency",
+      "x136": "Response_Correct_slow_100%_Congruency",
+      "x107": "Response_Correct_fast_0%_Congruency",
+      "x117": "Response_Correct_fast_33%_Congruency",
+      "x127": "Response_Correct_fast_66%_Congruency",
+      "x137": "Response_Correct_fast_100%_Congruency",
+      "x108": "Response_Incorrect_slow_0%_Congruency",
+      "x118": "Response_Incorrect_slow_33%_Congruency",
+      "x128": "Response_Incorrect_slow_66%_Congruency",
+      "x138": "Response_Incorrect_slow_100%_Congruency",
+      "x109": "Response_Incorrect_fast_0%_Congruency",
+      "x119": "Response_Incorrect_fast_33%_Congruency",
+      "x129": "Response_Incorrect_fast_66%_Congruency",
+      "x139": "Response_Incorrect_fast_100%_Congruency",
+      "x6": "Feedback_to_slow"
+    }
+  },
+  "Event": {
+    "LongName": "Event",
+    "Description": "Verbal Description of Event"
+  },
+  "Trial": {
+    "LongName": "Trial",
+    "Description": "Trial count, starting with 0"
+  },
+  "RT": {
+    "LongName": "RT",
+    "Description": "Response time after Target.",
+    "Unit": "second"
+  },
+  "ACC": {
+    "LongName": "ACC",
+    "Description": "Accuracy of Response to Target; 0 = incorrect, 1 = correct"
+  },
+  "Congruency": {
+    "LongName": "Congruency",
+    "Description": "Three Levels, 0 = no congruent Flankers, 1 = 1/3 congruent, 2 = 2/3 congruent, 3= 3/3 congruent"
+  },
+  "Experimenter": {
+    "LongName": "Experimenter",
+    "Description": "Experimenter Present or Absent"
+  },
+  "Post_Trial": {
+    "LongName": "Post_Trial",
+    "Description": "Previous Trial either Correct, Incorrect, or NA (for Breaks etc.)"
+  }
+}

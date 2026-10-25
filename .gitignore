@@ -1,0 +1,14 @@
+# Ignore everything in the repository root
+/*
+
+# Track the entire eeglabset directory and all its contents
+!/eeglabset/
+
+# Track the entire scripts directory and all its contents
+!/scripts/
+
+# Ignore all __pycache__ directories inside scripts recursively
+/scripts/**/__pycache__/
+
+# Track the .gitignore file itself
+!/.gitignore

@@ -1,0 +1,29 @@
+{
+  "TaskName": "Flanker",
+  "TaskDescription": "During the flanker task, participants are instructed to respond to a central letter with the corresponding button, while ignoring the letters around the target (flanker stimuli). Written feedback is given only after reactions slower than 1000 ms. Response mappings are counterbalanced between subjects. Importantly, two manipulations are implemented. First, task demand is manipulated by decreasing the congruency of flanker/target stimuli. Flanker stimuli can be either 100% congruent (e.g., SSSSSSS, 48 trials/block), 67% congruent (e.g., HSSSSSH, 16 trials/block), 33% congruent (e.g., HHSSSHH, 16 trials/block), or 0% congruent (e.g., HHHSHHH, 16 trials/block. All trial types are presented in a randomized order within across all blocks. Second, social pressure is manipulated across blocks, with the experimenter being present in the room for the first three testing blocks but not during the remaining three blocks. Order of this manipulation is randomized between subjects. At the beginning of the break, participants fill in an adaptation of the NASA-TLX (task load index). Self-reports of mood are the same as during the rest of the experiment. They are asked at the beginning of the break and at the end of the task.",
+  "CogAtlasID": "n/a",
+  "CogPOID": "n/a",
+  "OrganisingIstitution": "CoScience - Hamburg University",
+  "RecordingInstitution": "University Bonn Lab Beauducel",
+  "InstitutionalDepartmentName": "Dept. of Psychology",
+  "SamplingFrequency": 250,
+  "EEGChannelCount": 60,
+  "EOGChannelCount": 1,
+  "ECGChannelCount": 0,
+  "EMGChannelCount": 0,
+  "EEGReference": "FCZ",
+  "PowerLineFrequency": 50,
+  "EEGGround": "CMS/DRL",
+  "EEGPlacementScheme": "10-20",
+  "Manufacturer": "Biosemi",
+  "CapManufacturer": "Biosemi",
+  "HardwareFilters": {
+    "Lowpass Dal Filterr": {
+      "FilterOrder": 4,
+      "CutoffFrequency (Hz)": 128
+    }
+  },
+  "SoftwareFilters": "n/a",
+  "RecordingType": "continuous",
+  "SoftwareVersions": "ActiView"
+}

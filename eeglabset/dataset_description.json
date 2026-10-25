@@ -1,0 +1,29 @@
+{
+    "Name": "CoScience",
+    "BIDSVersion": "0.11.2",
+    "DatasetType": "raw",
+    "Authors": [
+        "Paul, Katharina",
+        "Short, Cassie Ann",
+        "Beauducel, André",
+        "Carsten, Hannes Per",
+        "Härpfer, Kai",
+        "Hennig, Jürgen",
+        "Hewig, Johannes",
+        "Hildebrandt, Andrea",
+        "Kührt, Corinna",
+        "Mueller, Erik Malte",
+        "Munk, Aisha",
+        "Osinsky, Roman",
+        "Porth, Elisa",
+        "Riesel, Anja",
+        "Rodrigues, Johannes",
+        "Scheffel, Christoph",
+        "Stahl, Jutta",
+        "Strobel, Alexander",
+        "Wacker, Jan"
+    ],
+    "Funding": [
+        "DFG 409321828"
+    ]
+}

@@ -1,0 +1,15 @@
+{
+    "participant_id": {
+        "Description": "participant identifier of the form sub-<label>"
+    },
+    "Sex": {
+        "Description": "Gender reported by participant",
+        "Levels": {
+            "M": "male",
+            "F": "female"
+        }
+    },
+    "PSWQ": {
+        "Description": "Score in the PSWQ"
+    }
+}
