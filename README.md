@@ -129,7 +129,132 @@ A line-noise detector and notch-filter branch exist, but their guard is currentl
 
 ### 3. Artifact preparation
 
-`scripts/ica_preparation.py` detects zero periods and sustained extreme peak-to-peak activity, assesses neighboring channels, detects amplitude and high-frequency candidates, compares waveform repetition, assigns response-aware labels, and opens manual review. The reviewed continuous recording is saved before ICA.
+`scripts/ica_preparation.py` prepares the preprocessed continuous EEG for ICA through two detection stages followed by manual review. The entry function runs `detect_period_artifacts()`, then `semi_auto_ica_cleaning()`, then `manual_review_artifacts()`. This stage marks time intervals and can mark channels bad; it does not remove ICA components, interpolate channels, or delete samples. Original task annotations and the sample timeline are preserved.
+
+Parameters come from `PeriodQCConfig` for period/channel QC and `ICAPrep` for candidate detection, waveform comparison, and response protection. Both configurations exclude `MASTl` and `MASTr` from screening. EEG channel types determine the remaining eligible channels, and channels already marked bad are excluded through MNE picking and an explicit check in candidate detection.
+
+#### 3.1 Sustained abnormal periods
+
+`detect_period_artifacts()` works channel by channel, using EEG amplitudes converted to microvolts. Existing BAD-annotated samples are requested as NaN. Electrode coordinates must be finite, nonzero, and in the head coordinate frame; otherwise processing raises an error. The eight nearest available EEG neighbors are selected using Euclidean distance between electrode positions.
+
+Two mechanisms identify abnormal periods:
+
+| Mechanism | Implemented rule with default settings |
+| --- | --- |
+| Zero periods | Consecutive samples satisfying `abs(signal) <= zero_tolerance_v` for at least 2 s. With the default tolerance of zero, this means exact zeros. |
+| Sustained extreme peak-to-peak activity | Evaluate 0.2 s windows every 0.1 s. Flag a window when its PTP exceeds 200 uV **or** exceeds the mean neighbor PTP plus three population standard deviations in that window. |
+
+For PTP detection, each flagged window contributes only one 0.1 s step near its center to the detection mask. A continuous run of this support must last at least 3 s to become a PTP interval. Zero and PTP intervals are then combined per channel; overlapping or touching intervals merge with the default gap of zero.
+
+The window exclusion helper recognizes annotation descriptions containing `boundary` or `edge` and skips windows crossing those discontinuities, including zero-duration boundaries. Positive-duration boundary intervals are also masked for zero detection. No additional discontinuity annotation is inserted by this QC stage.
+
+The parameter name `zero_tolerance_v` suggests volts, but the current comparison occurs after conversion to microvolts. The default zero is unaffected; if changing this parameter, account for the implementation's actual units.
+
+#### 3.2 Shared versus independent abnormalities
+
+Each detected channel interval is compared with its nearest neighbors. A neighbor must first be abnormal for at least 50% of that interval. The interval is then considered shared if at least one qualifying neighbor meets either applicable similarity criterion:
+
+- For zero samples, at least 50% of the channel's detected zero samples are also zero in that neighbor.
+- For finite waveforms with nonzero variance, the absolute Pearson correlation is at least 0.8. Positive and negative correlations both qualify.
+
+If no neighbor qualifies, the interval is independent. A shared interval receives a global annotation; an independent interval receives a channel-specific annotation with the affected channel attached.
+
+Two duration decisions are made separately:
+
+| Decision | Rule | Result |
+| --- | --- | --- |
+| Individual interval label | Interval duration is at least 1% of total recording duration. | `BAD_period` for shared intervals or `BAD_period_independent_<channel>` for independent intervals. |
+| Shorter interval label | Interval duration is below 1% of total recording duration. | Corresponding `REVIEW_period` or `REVIEW_period_independent_<channel>` label. |
+| Channel usability | Combined abnormal duration exceeds 30% of total recording duration and less than 50% of abnormal duration is classified as shared. | Channel is added to `raw.info['bads']`. |
+| Extensive shared abnormality | Combined abnormal duration exceeds 30% and at least 50% of abnormal duration is classified as shared. | Channel is reported as `data_unusable` and an extra browser opens for review; the code does not automatically abort or discard the participant. |
+
+These fractions use the entire recording sample count as the denominator for recording duration, rather than only unannotated data. For example, in a 600 s recording, one 6 s interval meets the 1% BAD-period threshold; several shorter separate intervals do not each become BAD merely because their combined duration exceeds 6 s.
+
+#### 3.3 Amplitude and high-frequency candidate detection
+
+`detect_artifacts()` scans the remaining eligible data in 1 s windows stepped every 0.1 s. Positive-duration annotations starting with `BAD` or `REVIEW` are masked across all selected channels for this detection stage, including channel-specific period annotations. Windows containing nonfinite samples or crossing recognized boundary/edge annotations are skipped. Thus, an earlier `REVIEW_period` is withheld from further candidate screening even though it remains retained for ICA unless manually relabeled.
+
+For every valid window and channel, the script calculates PTP amplitude and a Welch power spectral density using a Hann window, the full detection window as `nperseg`, no internal overlap, and constant detrending. Power is integrated separately over 30-45 Hz and 55-75 Hz, leaving the region around 50 Hz out of these detection features. This frequency selection does not itself filter line noise from the EEG.
+
+Power is transformed to decibels. A robust baseline is calculated independently for each channel and frequency band across all valid windows in that participant:
+
+```text
+log_power = 10 * log10(max(band_power, 1e-20))
+robust_sigma = max(1.4826 * median_absolute_deviation(log_power), 1.0)
+z_power = (log_power - median(log_power)) / robust_sigma
+```
+
+The scale floor is 1 dB. These are participant-specific screening scores, not inferential z tests.
+
+| Detection | Default rule |
+| --- | --- |
+| Candidate channel/window | PTP greater than 200 uV **or** power score greater than 4 in either frequency band. |
+| Candidate window | At least one selected channel meets the candidate rule. |
+| Severe channel/window | PTP greater than 250 uV **and** power score greater than 5 in either band, in the same channel and window. |
+| Severe window | At least `min_severe_channels` channels meet the severe rule; the default is one. |
+
+A high amplitude in one channel and high-frequency power in another cannot jointly satisfy the severe rule. All configured frequency bands must lie below Nyquist. Processing raises an error if the recording is shorter than one detection window, no valid channels remain, or no valid detection windows remain.
+
+#### 3.4 Persistence and interval construction
+
+Candidate and severe detections are converted to separate time masks. Each detected window contributes one step centered on the window. Contiguous center support must last at least `min_duration = 0.20 s` before it is accepted; a single isolated 1 s detection window therefore does not automatically pass the duration requirement.
+
+Accepted support intervals are expanded back toward their contributing 1 s analysis windows and clipped to recording limits. Overlapping or touching expanded intervals merge. Severe intervals are included in the final candidate union, so they are not lost during consolidation. `merge_gap = 0` allows no extra positive gap between final intervals.
+
+Consequently, the reported interval boundaries reflect detection-window support and expansion, rather than an exact sample-by-sample estimate of artifact onset and offset. Detection windows and minimum-duration settings are rounded to samples at the recording's sampling frequency.
+
+#### 3.5 Waveform repetition
+
+`find_repetitive_intervals()` compares final candidate intervals within the participant. `extract_waveform()` subtracts each channel's mean and rejects waveforms with fewer than five samples or nonfinite data. Intervals up to 2 s retain their original sampling points; longer intervals are resampled to 200 points for comparison. Short and long intervals are compared only within their respective groups, and paired durations must differ by a ratio no greater than 1.5.
+
+For each eligible pair, `waveform_similarity()` combines temporal and spatial agreement:
+
+1. Calculate each channel's standard deviation in both intervals. Select up to eight channels with the strongest shared activity, ranked by the smaller of their two standard deviations, and exclude channels with negligible variance.
+2. Calculate spatial similarity as the cosine similarity between the channel standard-deviation vectors across all selected EEG channels.
+3. Search temporal shifts up to approximately 0.08 s in either direction, requiring overlap of at least 80% of the longer waveform's sample count. For resampled long intervals, the shift conversion uses an effective sampling rate based on their mean duration.
+4. At each valid shift, recenter the overlapping signals and average their signed channel correlations. Multiply the best temporal correlation by spatial similarity and clip the result to [-1, 1].
+
+A score of at least 0.90 counts as a match. A valid candidate counts as matching itself; the default repetition threshold of three therefore requires at least two other matching intervals. Matching is evaluated for each candidate independently, rather than by requiring every member of a group to match every other member. Repetition flags an interval for review and does not automatically establish that it is safe or artifactual.
+
+#### 3.6 Response protection and automatic labels
+
+With `protect_erp = True`, response times are read from annotation extras using a whitespace-trimmed, case-insensitive `Event` comparison to `response`. Onsets are converted to time relative to the current Raw start. A candidate is ERP-related if it overlaps any response window from -0.5 to +0.5 s; merely touching a window endpoint does not count. Flanker- and target-locked windows are not separately protected.
+
+A candidate is severe if it overlaps any severe interval. The following table gives the complete default classification:
+
+| Severe | Repetitive | Overlaps response window | Label |
+| --- | --- | --- | --- |
+| Yes | Yes | Yes | `REVIEW_severe_repetitive_ERN` |
+| Yes | Yes | No | `REVIEW_severe_repetitive` |
+| Yes | No | Yes | `REVIEW_severe_ERN` |
+| Yes | No | No | `BAD_severe` |
+| No | Yes | Yes | `REVIEW_repetitive_ERN` |
+| No | Yes | No | `REVIEW_repetitive` |
+| No | No | Yes | `REVIEW_unique_ERN` |
+| No | No | No | `REVIEW_unique` |
+
+Setting `auto_reject_unique = True` changes the last row to `BAD_unique`. Disabling `protect_erp` removes response-overlap protection for this classification. Protection does not reverse BAD-period labels from the earlier QC stage, and manual review can still reject an interval overlapping a response.
+
+For a nonempty annotation collection, missing usable response metadata raises an error when response protection is enabled. A completely empty annotation collection returns no response times. The later epoch-creation function uses the stricter exact value `Response`, so consistent event capitalization remains necessary.
+
+New candidate labels are appended as global annotations while preserving existing task and period annotations. Interval calculations use seconds relative to the recording start; annotation onsets include `raw.first_time` when stored in MNE.
+
+#### 3.7 Manual decisions and saved records
+
+`manual_review_artifacts()` opens a blocking browser showing 10 s at a time, initially with 30 channels and automatic scaling. Press `a` to edit annotations. Inspect the waveform and spatial distribution, change rejected intervals to a `BAD_*` label, and use a non-BAD label such as `KEEP_*` for accepted intervals. Close the browser to return the edited Raw object and continue processing. Retaining `REVIEW_*` leaves the interval available for subsequent ICA and epoching; the program does not require every REVIEW label to be resolved.
+
+The artifact stage creates these records:
+
+| Record | Contents and timing |
+| --- | --- |
+| `results/<ID>/bad_period_results.tsv` | Automatic period QC before the main manual review: channel, start, duration, shared status, individual-period fraction, total affected fraction, shared fraction, unusable flag, and label. |
+| `results/<ID>/artifact_results_reviewed.tsv` | BAD/REVIEW/KEEP annotations after the main review: annotation index, relative start/end, duration, label, and `exclude_from_ica`. Original task event annotations are omitted. |
+| `eeglabset_fix/<ID>/eeg/<ID>_task_Flanker_eeg_before_ica.fif` | Continuous preprocessed EEG with reviewed annotations and bad-channel state. |
+| Console summary | Reviewed annotation counts, label counts, and merged BAD duration and percentage. Overlapping BAD intervals are merged to avoid double-counting time. |
+
+The automatic candidate report additionally contains severity, repetition count, and ERP-overlap flags in memory, but `main()` does not export that full report or the automatic summary. The reviewed TSV does not include annotation channel scopes or the bad-channel list; those remain in the FIF recording. Its duration summary combines BAD intervals across channels, rather than reporting separate channel-specific data loss. The label counts printed after the reviewed summary come from the automatic candidate report and can differ from the final manual labels.
+
+MNE's annotation rejection and channel-picking behavior determine how stored BAD intervals and bad channels affect ICA fitting and epoch creation. This stage preserves data samples for later processing; annotations identify which portions should be omitted. Subsequent ICA rerun review can update the saved continuous data again, but does not refresh the original reviewed-artifact TSV.
 
 ### 4. ICA and ICLabel
 
