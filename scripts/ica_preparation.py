@@ -1,87 +1,92 @@
-"""
-Semi-automatic EEG artifact cleaning before ICA
-================================================
+"""Detect and review continuous EEG artifacts before ICA.
 
-Pipeline:
-1. Detect candidate artifacts
-2. Detect high-frequency + high-amplitude artifacts
-3. Merge intervals and apply minimum duration
-4. Compare waveform similarity among remaining intervals
-5. Identify repetitive waveforms
-6. Protect stimulus/response-related intervals
-7. Generate MNE annotations
-8. Save ICA training dataset and detection report
+Tasks:
+- Detect bad periods/channels and local amplitude/power anomalies.
+- Identify repetitive waveforms and protect response-related periods.
+- Add BAD/REVIEW labels and perform optional validated manual review.
+- Update reference after new bad-channel decisions and export QC reports.
 
-Dependencies:
-    mne
-    numpy
-    scipy
-    pandas
+Inputs: MNE Raw data, detection settings, participant ID and output paths.
 
-Input:
-    MNE Raw object
+Outputs: Annotated Raw, QC tables/summaries and pre-ICA EEG.
 
-Output:
-    raw_ica: ICA training copy with annotations
-    report: pandas DataFrame
-    summary: dict
-
-All interval times are relative to the beginning of Raw.
+Usage: Period QC is called by preprocess.py; main() is called by ica.py.
 """
 
+from __future__ import annotations
+
+from pipeline_logging import print, timed_step
 from collections import Counter
 from pathlib import Path
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 import mne
 from scipy.signal import welch, resample
 
-from constants import PeriodQCConfig, ICAPrep
+from constants import PeriodQCConfig, ICAPrep, ModeConfiguration
+from typing import Any, TypeAlias, TypedDict
+from numpy.typing import NDArray
+
+Interval: TypeAlias = tuple[float, float]
+
+
+class Waveform(TypedDict):
+    """A candidate waveform and the timing information needed for similarity scoring."""
+
+    data: NDArray[np.float64]
+    duration: float
+    normalized: bool
 
 # ============================================================
 # 1. BASIC UTILITIES
 # ============================================================
-def get_eeg_picks(raw: mne.io.BaseRaw, cfg: ICAPrep | PeriodQCConfig) -> np.ndarray:
-    picks = mne.pick_types(
-        raw.info,
-        eeg=True
+
+
+def get_eeg_picks(
+    raw: mne.io.BaseRaw,
+    cfg: ICAPrep | PeriodQCConfig,
+) -> NDArray[np.int_]:
+    """Select EEG channels allowed by the artifact-screening configuration."""
+    picks = mne.pick_types(raw.info, eeg=True)
+    return np.array(
+        [ p for p in picks if raw.ch_names[p] not in cfg.exclude_channels ],
+        dtype=int
     )
-    return np.array([
-        p for p in picks
-        if raw.ch_names[p] not in cfg.exclude_channels
-    ], dtype=int)
+
 
 def merge_intervals(
-    intervals: list,
-    gap: float=0.0,
-    min_duration: float=0.20,
-):
+    intervals: Iterable[Interval],
+    gap: float = 0.0,
+    min_duration: float = 0.20,
+) -> list[Interval]:
     """Merge overlapping/nearby intervals.
     """
-    intervals = sorted(
-        (float(a), float(b))
-        for a, b in intervals
-        if b > a
-    )
+    intervals = sorted((float(a), float(b)) for a, b in intervals if b > a)
+
     if not intervals:
         return []
+
     merged = [list(intervals[0])]
+
     for start, end in intervals[1:]:
         if start <= merged[-1][1] + gap:
-            merged[-1][1] = max(
-                merged[-1][1], end
-            )
+            merged[-1][1] = max(merged[-1][1], end)
         else:
             merged.append([start, end])
+
     return [
         (a, b)
         for a, b in merged
         if b - a >= min_duration
     ]
 
-def subtract_intervals(intervals, excluded):
+
+def subtract_intervals(
+    intervals: Sequence[Interval],
+    excluded: Sequence[Interval],
+) -> list[Interval]:
     """Subtract severe intervals from ordinary candidates.
 
     """
@@ -102,32 +107,45 @@ def subtract_intervals(intervals, excluded):
         result.extend(pieces)
     return result
 
-def mask_to_intervals(mask, fs, min_duration=0.0):
+
+def mask_to_intervals(
+    mask: NDArray[np.bool_],
+    fs: float,
+    min_duration: float = 0.0,
+) -> list[Interval]:
     """Convert sample mask into time intervals."""
-    edges = np.diff(
-        np.r_[False, mask, False].astype(int)
-    )
+    edges = np.diff(np.r_[False, mask, False].astype(int))
     starts = np.flatnonzero(edges == 1)
     stops = np.flatnonzero(edges == -1)
+
     return [
         (a / fs, b / fs)
         for a, b in zip(starts, stops)
         if (b - a) / fs >= min_duration
     ]
 
-def intervals_to_mask(intervals, n_samples, fs):
+
+def intervals_to_mask(
+    intervals: Iterable[Interval],
+    n_samples: int,
+    fs: float,
+) -> NDArray[np.bool_]:
+    """Convert time intervals into a sample-aligned Boolean mask."""
     mask = np.zeros(n_samples, dtype=bool)
     for start, end in intervals:
         a = max(0, int(np.floor(start * fs)))
-        b = min(
-            n_samples,
-            int(np.ceil(end * fs))
-        )
+        b = min(n_samples, int(np.ceil(end * fs)))
         mask[a:b] = True
 
     return mask
 
-def get_excluded_start_ranges(raw, win, include_periods=False):
+
+def get_excluded_start_ranges(
+    raw: mne.io.BaseRaw,
+    win: int,
+    include_periods: bool = False,
+) -> list[Interval]:
+    """Find window-start ranges crossing boundaries or excluded artifact periods."""
 
     fs = raw.info["sfreq"]
     ranges = []
@@ -138,7 +156,7 @@ def get_excluded_start_ranges(raw, win, include_periods=False):
         is_boundary = "boundary" in desc or "edge" in desc
         is_period = (
             include_periods
-            and desc.startswith(("bad_", "review_"))
+            and desc.startswith(("bad", "review"))
         )
 
         if not (is_boundary or is_period):
@@ -166,7 +184,11 @@ def get_excluded_start_ranges(raw, win, include_periods=False):
 # 2. BAD CHANNEL DETECTION
 # ============================================================
 
-def detect_period_artifacts(raw, cfg: PeriodQCConfig):
+@timed_step("Period and bad-channel QC")
+def detect_period_artifacts(
+        raw: mne.io.BaseRaw,
+        cfg: PeriodQCConfig
+) -> tuple[mne.io.BaseRaw, pd.DataFrame]:
     """Return a Raw copy with QC annotations and a period-level report."""
     raw = raw.copy()
     fs = raw.info["sfreq"]
@@ -176,10 +198,15 @@ def detect_period_artifacts(raw, cfg: PeriodQCConfig):
     picks = get_eeg_picks(raw, cfg)
     if not picks.size:
         raise ValueError("No EEG channels available for screening.")
-    data = raw.get_data(
-        picks=picks,
-        reject_by_annotation="NaN",
-    ) * 1e6
+    data = raw.get_data(picks=picks, reject_by_annotation=None) * 1e6
+    for ann_index, ann in enumerate(raw.annotations):
+        if not str(ann["description"]).casefold().startswith("bad"):
+            continue
+        a = max(0, int(np.floor((ann["onset"] - raw.first_time) * fs)))
+        b = min(raw.n_times, int(np.ceil((ann["onset"] - raw.first_time + ann["duration"]) * fs)))
+        scope = raw.annotations.ch_names[ann_index]
+        affected = [i for i, p in enumerate(picks) if not scope or raw.ch_names[p] in scope]
+        data[affected, a:b] = np.nan
 
     n_channels, n_samples = data.shape
 
@@ -282,7 +309,7 @@ def detect_period_artifacts(raw, cfg: PeriodQCConfig):
     # Detect zero periods and sustained extreme PTP.
     for i, x in enumerate(data):
         zero_intervals = mask_to_intervals(
-            (np.abs(x) <= cfg.zero_tolerance_v) & ~boundary_mask,
+            (np.abs(x) <= cfg.zero_tolerance_v * 1e6) & ~boundary_mask,
             fs,
             min_duration=cfg.zero_min_sec,
         )
@@ -419,7 +446,7 @@ def detect_period_artifacts(raw, cfg: PeriodQCConfig):
 
             prefix = (
                 "BAD"
-                if period_fraction >= cfg.bad_period_fraction
+                if shared and period_fraction >= cfg.bad_period_fraction
                 else "REVIEW"
             )
             label = f"{prefix}_period"
@@ -468,14 +495,20 @@ def detect_period_artifacts(raw, cfg: PeriodQCConfig):
             f"Data marked unusable pending manual review: {unusable}. "
             "Total abnormal duration exceeds 30% and is predominantly shared."
         )
-        raw.plot(block=True, scalings="auto")
+        # The caller saves the QC report and blocks this record.
 
     return raw, report
 
 # ============================================================
 # 3. AUTOMATIC CANDIDATE DETECTION
 # ============================================================
-def detect_artifacts(raw: mne.io.BaseRaw, cfg:ICAPrep):
+
+
+@timed_step("Local artifact candidate detection")
+def detect_artifacts(
+    raw: mne.io.BaseRaw,
+    cfg: ICAPrep,
+) -> tuple[list[Interval], list[Interval]]:
     """
     Detect all candidate and severe artifact intervals.
 
@@ -490,13 +523,18 @@ def detect_artifacts(raw: mne.io.BaseRaw, cfg:ICAPrep):
         all_intervals, severe_intervals
     """
     fs = raw.info["sfreq"]
-    picks = np.array([
-        p for p in get_eeg_picks(raw, cfg)
-        if raw.ch_names[p] not in raw.info["bads"]
-    ], dtype=int)
+    picks = np.array(
+        [
+            p
+            for p in get_eeg_picks(raw, cfg)
+            if raw.ch_names[p] not in raw.info["bads"]
+        ],
+        dtype=int
+    )
 
     if len(picks) == 0:
         raise ValueError("No valid EEG channels")
+
     for low, high in cfg.high_freq_band:
         if not (0 < low < high < fs / 2):
             raise ValueError(
@@ -504,10 +542,7 @@ def detect_artifacts(raw: mne.io.BaseRaw, cfg:ICAPrep):
                 f"require 0 < low < high < Nyquist ({fs / 2} Hz)"
             )
     # Convert from V to µV
-    data = raw.get_data(
-        picks=picks,
-        reject_by_annotation="NaN",
-    ) * 1e6
+    data = raw.get_data(picks=picks, reject_by_annotation="NaN") * 1e6
 
     n_ch, n_samples = data.shape
 
@@ -538,20 +573,15 @@ def detect_artifacts(raw: mne.io.BaseRaw, cfg:ICAPrep):
 
     if win > n_samples:
         raise ValueError("Recording is too short")
-    starts = np.arange(
-        0,
-        n_samples - win + 1,
-        step,
-    )
+
+    starts = np.arange(0, n_samples - win + 1, step)
 
     valid_starts = []
     powers = []
     amplitudes = []
 
     # Detect annotation discontinuities / boundaries
-    excluded_start_ranges = get_excluded_start_ranges(
-        raw, win, include_periods=True
-    )
+    excluded_start_ranges = get_excluded_start_ranges(raw, win, include_periods=True)
 
     # --------------------------------------------------------
     # First pass: calculate PSD + amplitude
@@ -589,11 +619,7 @@ def detect_artifacts(raw: mne.io.BaseRaw, cfg:ICAPrep):
                 (freqs >= low) &
                 (freqs <= high)
             )
-            band_power = np.trapezoid(
-                psd[:, band_mask],
-                freqs[band_mask],
-                axis=-1,
-            )
+            band_power = np.trapezoid(psd[:, band_mask], freqs[band_mask], axis=-1)
 
             band_powers.append(band_power)
 
@@ -603,9 +629,7 @@ def detect_artifacts(raw: mne.io.BaseRaw, cfg:ICAPrep):
         powers.append(band_powers)
 
     if not valid_starts:
-        raise ValueError(
-            "No valid windows for detection"
-        )
+        raise ValueError("No valid windows for detection")
 
     valid_starts = np.asarray(valid_starts)
     amplitudes = np.stack(amplitudes)
@@ -614,21 +638,10 @@ def detect_artifacts(raw: mne.io.BaseRaw, cfg:ICAPrep):
     # --------------------------------------------------------
     # Second pass: robust per-channel power baseline
     # --------------------------------------------------------
-    log_power = 10 * np.log10(
-        np.maximum(powers, 1e-20)
-    )
-    median_power = np.median(
-        log_power,
-        axis=0,
-    )
-    mad = np.median(
-        np.abs(log_power - median_power),
-        axis=0,
-    )
-    robust_sigma = np.maximum(
-        1.4826 * mad,
-        1.0,
-    )
+    log_power = 10 * np.log10(np.maximum(powers, 1e-20))
+    median_power = np.median(log_power, axis=0)
+    mad = np.median(np.abs(log_power - median_power), axis=0)
+    robust_sigma = np.maximum(1.4826 * mad, 1.0)
 
     z_power = (
         log_power - median_power
@@ -640,25 +653,16 @@ def detect_artifacts(raw: mne.io.BaseRaw, cfg:ICAPrep):
     candidate_amplitude = (
         amplitudes > cfg.candidate_amp_uv
     )
-    candidate_frequency = np.any(
-        z_power > cfg.candidate_power_z,
-        axis=-1,
-    )
+    candidate_frequency = np.any(z_power > cfg.candidate_power_z, axis=-1)
 
     # Broad candidate screening
     candidate_channels = (
         candidate_amplitude |
         candidate_frequency
     )
-    candidate_windows = np.any(
-        candidate_channels,
-        axis=1,
-    )
+    candidate_windows = np.any(candidate_channels, axis=1)
 
-    severe_frequency = np.any(
-        z_power > cfg.severe_power_z,
-        axis=-1,
-    )
+    severe_frequency = np.any(z_power > cfg.severe_power_z, axis=-1)
 
     # Severe: BOTH conditions in SAME channel
     severe_channels = (
@@ -673,12 +677,8 @@ def detect_artifacts(raw: mne.io.BaseRaw, cfg:ICAPrep):
     # --------------------------------------------------------
     # Fourth pass: convert window detections to intervals
     # --------------------------------------------------------
-    candidate_mask = np.zeros(
-        n_samples, dtype=bool
-    )
-    severe_mask = np.zeros(
-        n_samples, dtype=bool
-    )
+    candidate_mask = np.zeros(n_samples, dtype=bool)
+    severe_mask = np.zeros(n_samples, dtype=bool)
 
     for start, candidate, severe in zip(
         valid_starts,
@@ -697,9 +697,7 @@ def detect_artifacts(raw: mne.io.BaseRaw, cfg:ICAPrep):
     # Otherwise one 1-second window always passes a 0.2s cutoff.
     #
     # Use window centers to estimate persistence.
-    center_mask = np.zeros(
-        n_samples, dtype=bool
-    )
+    center_mask = np.zeros(n_samples, dtype=bool)
     severe_center_mask = center_mask.copy()
 
     for start, candidate, severe in zip(
@@ -716,23 +714,17 @@ def detect_artifacts(raw: mne.io.BaseRaw, cfg:ICAPrep):
             a = max(0, center - step // 2)
             b = min(n_samples, a + step)
             severe_center_mask[a:b] = True
-    persistent_candidate = mask_to_intervals(
-        center_mask,
-        fs,
-        cfg.min_duration,
-    )
-    persistent_severe = mask_to_intervals(
-        severe_center_mask,
-        fs,
-        cfg.min_duration,
-    )
+
+    persistent_candidate = mask_to_intervals(center_mask, fs, cfg.min_duration)
+    persistent_severe = mask_to_intervals(severe_center_mask, fs, cfg.min_duration)
 
     # Expand accepted detections to their contributing
     # analysis windows; merge only afterward.
     left_pad = (win // 2 - step // 2) / fs
     right_pad = (win - (win // 2 - step // 2) - step) / fs
 
-    def expand_intervals(intervals):
+    def expand_intervals(intervals: Sequence[Interval]) -> list[Interval]:
+        """Expand persistent detections to their contributing analysis-window boundaries."""
         expanded = [
             (
                 max(0.0, a - left_pad),
@@ -741,11 +733,7 @@ def detect_artifacts(raw: mne.io.BaseRaw, cfg:ICAPrep):
             for a, b in intervals
         ]
 
-        return merge_intervals(
-            expanded,
-            gap=0.0,
-            min_duration=0.0,
-        )
+        return merge_intervals(expanded, gap=0.0, min_duration=0.0)
 
     all_intervals = expand_intervals(persistent_candidate)
     severe_intervals = expand_intervals(persistent_severe)
@@ -763,12 +751,14 @@ def detect_artifacts(raw: mne.io.BaseRaw, cfg:ICAPrep):
 # ============================================================
 # 4. WAVEFORM EXTRACTION
 # ============================================================
+
+
 def extract_waveform(
-    raw,
-    interval,
-    picks,
-    cfg,
-):
+    raw: mne.io.BaseRaw,
+    interval: Interval,
+    picks: NDArray[np.int_],
+    cfg: ICAPrep,
+) -> Waveform | None:
     """
     Extract waveform for similarity comparison.
 
@@ -790,36 +780,30 @@ def extract_waveform(
     start, end = interval
     fs = raw.info["sfreq"]
     a = max(0, int(round(start * fs)))
-    b = min(
-        raw.n_times,
-        int(round(end * fs))
-    )
+    b = min(raw.n_times, int(round(end * fs)))
+
     if b - a < 5:
         return None
+
     x = raw.get_data(
         picks=picks,
         start=a,
         stop=b,
         reject_by_annotation="NaN",
     )
+
     if not np.isfinite(x).all():
         return None
 
     duration = (b - a) / fs
 
     # Remove DC from each channel
-    x = x - np.mean(
-        x, axis=1, keepdims=True
-    )
+    x = x - np.mean(x, axis=1, keepdims=True)
     # Classify according to duration
     is_long = duration > cfg.long_candidate_sec
 
     if is_long:
-        x = resample(
-            x,
-            cfg.waveform_points,
-            axis=1,
-        )
+        x = resample(x, cfg.waveform_points, axis=1)
 
     return {
         "data": x,
@@ -831,11 +815,12 @@ def extract_waveform(
 # 5. WAVEFORM SIMILARITY
 # ============================================================
 
+
 def waveform_similarity(
-    x_info,
-    y_info,
-    cfg,
-):
+    x_info: Waveform | None,
+    y_info: Waveform | None,
+    cfg: ICAPrep,
+) -> float:
     """
     Compare temporal waveform shape and spatial distribution.
 
@@ -847,10 +832,13 @@ def waveform_similarity(
     # Never compare short with long candidates
     if x_info["normalized"] != y_info["normalized"]:
         return 0.0
+
     x = x_info["data"]
     y = y_info["data"]
+
     if x.shape[0] != y.shape[0]:
         return 0.0
+
     duration_x = x_info["duration"]
     duration_y = y_info["duration"]
 
@@ -871,9 +859,7 @@ def waveform_similarity(
         # Length / duration gives original sampling rate.
         effective_fs = x.shape[1] / duration_x
 
-    max_lag = int(round(
-        cfg.max_time_shift_sec * effective_fs
-    ))
+    max_lag = int(round( cfg.max_time_shift_sec * effective_fs ))
 
     # -----------------------------------------
     # 2. Channel amplitude distributions
@@ -883,24 +869,19 @@ def waveform_similarity(
     sy = np.std(y, axis=1)
     strength = np.minimum(sx, sy)
 
-    idx = np.argsort(strength)[
-        -cfg.max_similarity_channels:
-    ]
+    idx = np.argsort(strength)[-cfg.max_similarity_channels:]
     valid = (
         (sx[idx] > 1e-12) &
         (sy[idx] > 1e-12)
     )
 
     idx = idx[valid]
+
     if len(idx) == 0:
         return 0.0
 
     # Spatial similarity from all EEG channels
-    spatial = np.dot(sx, sy) / max(
-        np.linalg.norm(sx) *
-        np.linalg.norm(sy),
-        1e-20,
-    )
+    spatial = np.dot(sx, sy) / max(np.linalg.norm(sx) * np.linalg.norm(sy), 1e-20)
 
     # -----------------------------------------
     # 3. Find best temporal alignment
@@ -914,29 +895,18 @@ def waveform_similarity(
 
     best_temporal = -1.0
 
-    min_overlap = int(np.ceil(
-        cfg.min_overlap_fraction * max(nx, ny)
-    ))
+    min_overlap = int(np.ceil( cfg.min_overlap_fraction * max(nx, ny) ))
 
     for lag in range(-max_lag, max_lag + 1):
         # Positive lag shifts the starting point of x.
         # Negative lag shifts the starting point of y.
         x_start = max(0, lag)
         y_start = max(0, -lag)
-        overlap = min(
-            nx - x_start,
-            ny - y_start,
-        )
+        overlap = min(nx - x_start, ny - y_start)
         if overlap < min_overlap:
             continue
-        x_part = xx[
-            :,
-            x_start:x_start + overlap
-        ]
-        y_part = yy[
-            :,
-            y_start:y_start + overlap
-        ]
+        x_part = xx[:, x_start:x_start + overlap]
+        y_part = yy[:, y_start:y_start + overlap]
 
         # Re-center after cropping overlapping segments
         x_part = (
@@ -947,42 +917,30 @@ def waveform_similarity(
             y_part -
             y_part.mean(axis=1, keepdims=True)
         )
-        numerator = np.sum(
-            x_part * y_part,
-            axis=1,
-        )
+        numerator = np.sum(x_part * y_part, axis=1)
         denominator = np.sqrt(
             np.sum(x_part ** 2, axis=1) *
             np.sum(y_part ** 2, axis=1)
         )
-        correlations = numerator / np.maximum(
-            denominator,
-            1e-20,
-        )
+        correlations = numerator / np.maximum(denominator, 1e-20)
         temporal = float(np.mean(correlations))
-        best_temporal = max(
-            best_temporal,
-            temporal,
-        )
+        best_temporal = max(best_temporal, temporal)
 
     if best_temporal == -1.0:
         return 0.0
 
-    return float(np.clip(
-        best_temporal * spatial,
-        -1.0,
-        1.0,
-    ))
+    return float(np.clip( best_temporal * spatial, -1.0, 1.0, ))
 
 # ============================================================
 # 6. FIND REPETITIVE WAVEFORMS
 # ============================================================
 
+
 def find_repetitive_intervals(
-    raw,
-    intervals,
-    cfg,
-):
+    raw: mne.io.BaseRaw,
+    intervals: Sequence[Interval],
+    cfg: ICAPrep,
+) -> tuple[NDArray[np.bool_], NDArray[np.int_]]:
     """
     Identify repetitive artifact waveforms.
 
@@ -997,31 +955,27 @@ def find_repetitive_intervals(
     """
 
     n = len(intervals)
+
     if n == 0:
         return (
             np.array([], dtype=bool),
             np.array([], dtype=int),
         )
+
     picks = get_eeg_picks(raw, cfg)
     waveforms = [
-        extract_waveform(
-            raw,
-            interval,
-            picks,
-            cfg,
-        )
+        extract_waveform(raw, interval, picks, cfg)
         for interval in intervals
     ]
-    durations = np.array([
-        end - start
-        for start, end in intervals
-    ])
+    durations = np.array([ end - start for start, end in intervals ])
 
     # Invalid waveforms do not count as repetitions
     similarity = np.zeros((n, n), dtype=float)
+
     for i in range(n):
         if waveforms[i] is not None:
             similarity[i, i] = 1.0
+
     for i in range(n):
         if waveforms[i] is None:
             continue
@@ -1035,22 +989,13 @@ def find_repetitive_intervals(
             ):
                 continue
             # Original duration-ratio restriction
-            duration_ratio = max(
-                durations[i],
-                durations[j],
-            ) / max(
-                min(durations[i], durations[j]),
-                1e-10,
-            )
+            duration_ratio = max(durations[i], durations[j]) / max(min(durations[i], durations[j]), 1e-10)
             if duration_ratio > cfg.max_duration_ratio:
                 continue
-            score = waveform_similarity(
-                waveforms[i],
-                waveforms[j],
-                cfg,
-            )
+            score = waveform_similarity(waveforms[i], waveforms[j], cfg)
             similarity[i, j] = score
             similarity[j, i] = score
+
     matches = (
         similarity >= cfg.similarity_threshold
     )
@@ -1065,9 +1010,11 @@ def find_repetitive_intervals(
 # ============================================================
 # 7. EVENT-AWARE CLASSIFICATION
 # ============================================================
-def get_response_times(raw):
+
+
+def get_response_times(raw: mne.io.BaseRaw) -> NDArray[np.float64]:
     """
-    Extract response events from raw.annotations.extras.
+    Extract response onsets from trimmed, case-insensitive annotation metadata.
 
     Response events are identified by:
         extras["Event"] == "Response"
@@ -1085,20 +1032,20 @@ def get_response_times(raw):
         return np.array([], dtype=float)
 
     if annotations.extras is None:
-        raise ValueError(
-            "raw.annotations.extras is missing."
-        )
+        raise ValueError("raw.annotations.extras is missing.")
 
     # Boolean mask aligned with annotations
-    response_mask = np.array([
-        isinstance(extra, Mapping)
-        and str(extra.get("Event", "")).strip().casefold() == "response"
-        for extra in annotations.extras
-    ], dtype=bool)
+    response_mask = np.array(
+        [
+            isinstance(extra, Mapping)
+            and str(extra.get("Event", "")).strip().casefold() == "response"
+            for extra in annotations.extras
+        ],
+        dtype=bool
+    )
+
     if not response_mask.any():
-        raise ValueError(
-            "No event value found, please check _event.tsv file."
-        )
+        raise ValueError("No event value found, please check _event.tsv file.")
 
     # Annotation onsets are stored in the Raw annotation
     # time coordinate; convert to current Raw-relative time.
@@ -1109,12 +1056,13 @@ def get_response_times(raw):
 
     return np.asarray(response_times, dtype=float)
 
+
 def overlaps_events(
-    start,
-    end,
-    event_times,
-    event_window,
-):
+    start: float,
+    end: float,
+    event_times: NDArray[np.float64],
+    event_window: Interval,
+) -> bool:
     """
     Check whether an artifact interval overlaps
     any response-locked ERN epoch.
@@ -1123,16 +1071,14 @@ def overlaps_events(
     if len(event_times) == 0:
         return False
 
-    return bool(np.any(
-        (start < event_times + event_window[1]) &
-        (end > event_times + event_window[0])
-    ))
+    return bool(np.any( (start < event_times + event_window[1]) & (end > event_times + event_window[0]) ))
+
 
 def is_erp_related(
-    interval,
-    response_times,
-    cfg,
-):
+    interval: Interval,
+    response_times: NDArray[np.float64],
+    cfg: ICAPrep,
+) -> bool:
     """
     Check whether an artifact overlaps an ERN epoch.
 
@@ -1142,23 +1088,20 @@ def is_erp_related(
 
     start, end = interval
 
-    return overlaps_events(
-        start,
-        end,
-        response_times,
-        cfg.response_window,
-    )
+    return overlaps_events(start, end, response_times, cfg.response_window)
 
 # ============================================================
 # 8. FULL ARTIFACT CLASSIFICATION
 # ============================================================
 
+
+@timed_step("Artifact classification")
 def classify_all_artifacts(
-    raw,
-    all_intervals,
-    severe_intervals,
-    cfg,
-):
+    raw: mne.io.BaseRaw,
+    all_intervals: Sequence[Interval],
+    severe_intervals: Sequence[Interval],
+    cfg: ICAPrep,
+) -> pd.DataFrame:
     """
     Classify detected EEG artifact intervals.
 
@@ -1183,11 +1126,7 @@ def classify_all_artifacts(
         else np.array([], dtype=float)
     )
 
-    repetitive, counts = find_repetitive_intervals(
-        raw,
-        all_intervals,
-        cfg,
-    )
+    repetitive, counts = find_repetitive_intervals(raw, all_intervals, cfg)
 
     records = []
 
@@ -1207,11 +1146,7 @@ def classify_all_artifacts(
         # a response-locked ERN epoch.
         ern_related = (
             cfg.protect_erp
-            and is_erp_related(
-                interval,
-                response_times,
-                cfg,
-            )
+            and is_erp_related(interval, response_times, cfg)
         )
 
         # Waveform repetition classification
@@ -1270,10 +1205,15 @@ def classify_all_artifacts(
 # 9. MNE ANNOTATIONS
 # ============================================================
 
-def add_artifact_annotations(raw, report):
+
+def add_artifact_annotations(
+    raw: mne.io.BaseRaw,
+    report: pd.DataFrame,
+) -> mne.io.BaseRaw:
+    """Append classified artifact annotations to a copy of the continuous EEG."""
 
     cleaned = raw.copy()
-    annotations = cleaned.annotations.copy()
+    annotations = cleaned.annotations
 
     for row in report.itertuples():
         # MNE annotations use absolute raw timeline offset
@@ -1282,7 +1222,7 @@ def add_artifact_annotations(raw, report):
             duration=row.duration,
             description=row.label,
         )
-    cleaned.set_annotations(annotations)
+    # Direct append preserves first_samp and measurement-date alignment.
 
     return cleaned
 
@@ -1290,7 +1230,12 @@ def add_artifact_annotations(raw, report):
 # 10. SUMMARY
 # ============================================================
 
-def summarize_cleaning(raw, report):
+
+def summarize_cleaning(
+    raw: mne.io.BaseRaw,
+    report: pd.DataFrame,
+) -> dict[str, Any]:
+    """Summarize candidate labels and newly excluded artifact duration."""
 
     duration = raw.n_times / raw.info["sfreq"]
     bad_intervals = [
@@ -1298,11 +1243,7 @@ def summarize_cleaning(raw, report):
         for row in report.itertuples()
         if row.label.startswith("BAD")
     ]
-    bad_mask = intervals_to_mask(
-        bad_intervals,
-        raw.n_times,
-        raw.info["sfreq"],
-    )
+    bad_mask = intervals_to_mask(bad_intervals, raw.n_times, raw.info["sfreq"])
     bad_duration = (
         bad_mask.sum() / raw.info["sfreq"]
     )
@@ -1310,16 +1251,10 @@ def summarize_cleaning(raw, report):
     summary = {
         "duration_sec": duration,
         "candidate_intervals": len(report),
-        "bad_intervals": sum(
-            report["label"].str.startswith("BAD")
-        ),
-        "review_intervals": sum(
-            report["label"].str.startswith("REVIEW")
-        ),
+        "bad_intervals": sum(report["label"].str.startswith("BAD")),
+        "review_intervals": sum(report["label"].str.startswith("REVIEW")),
         "new_bad_duration_sec": bad_duration,
-        "new_bad_percent": (
-            100 * bad_duration / duration
-        ),
+        "new_bad_percent": (100 * bad_duration / duration),
     }
 
     return summary
@@ -1328,11 +1263,13 @@ def summarize_cleaning(raw, report):
 # 11. MAIN PIPELINE
 # ============================================================
 
+
 def semi_auto_ica_cleaning(
-    raw,
-    cfg,
-):
-    """
+    raw: mne.io.BaseRaw,
+    cfg: ICAPrep,
+) -> tuple[mne.io.BaseRaw, pd.DataFrame, dict[str, Any]]:
+    """Detect, classify and annotate candidate artifacts before optional manual review.
+
     Input:
         Raw with EEG channel types correctly defined.
 
@@ -1348,65 +1285,76 @@ def semi_auto_ica_cleaning(
     )
 
     # 2. Waveform analysis and classification
-    report = classify_all_artifacts(
-        raw,
-        all_intervals,
-        severe_intervals,
-        cfg,
-    )
+    report = classify_all_artifacts(raw, all_intervals, severe_intervals, cfg)
 
     # 3. Add annotations
-    raw_ica = add_artifact_annotations(
-        raw,
-        report,
-    )
+    raw_ica = add_artifact_annotations(raw, report)
 
     # 4. Summary
-    summary = summarize_cleaning(
-        raw,
-        report,
-    )
+    summary = summarize_cleaning(raw, report)
 
     return raw_ica, report, summary
 
+
+@timed_step("Artifact review or automatic pass-through")
 def manual_review_artifacts(
-    annotated_raw,
-) -> tuple[mne.io.BaseRaw, pd.DataFrame, dict]:
-    """
-    Interactively review artifact annotations.
-
-    BAD_*:
-        Excluded from ICA fitting.
-
-    REVIEW_* / KEEP_*:
-        Retained during ICA fitting.
-
-    Changes made in the MNE Raw browser are saved
-    after the browser window is closed.
-    """
+    annotated_raw: mne.io.BaseRaw,
+) -> tuple[mne.io.BaseRaw, pd.DataFrame, dict[str, Any]]:
+    """Optionally review artifacts; automatic mode preserves pending REVIEW labels."""
 
     # Work on a copy to preserve automatic detection results
     reviewed_raw = annotated_raw.copy()
+    original_bads = set(annotated_raw.info["bads"])
+    mode = ModeConfiguration()
 
-    print("\n=== Manual artifact review ===")
-    print("BAD_*    : Exclude from ICA")
-    print("REVIEW_* : Retain for ICA, pending review")
-    print("KEEP_*   : Manually accepted for ICA")
-    print("\nPress 'a' to enter annotation mode.")
-    print("Edit annotations and close the browser when finished.")
+    if mode.semi_auto:
+        print("\n=== Manual artifact review ===")
+        print("BAD_*    : Exclude from ICA")
+        print("REVIEW_* : Must resolve to KEEP or BAD before ICA")
+        print("KEEP_*   : Manually accepted for ICA")
+        print("\nPress 'a' to enter annotation mode.")
+        print("Edit annotations and close the browser when finished.")
 
-    # Open interactive Raw browser
-    reviewed_raw.plot(
-        duration=10.0,
-        start=0.0,
-        n_channels=30,
-        scalings="auto",
-        show=True,
-        block=True,
-        title="Manual artifact review for ICA",
-    )
+    else:
+        print("Automatic mode: manual review skipped; REVIEW intervals retained pending review.")
 
-    # Browser has closed: annotations now contain manual edits
+    while mode.semi_auto:
+        reviewed_raw.plot(
+            duration=10.0,
+            start=0.0,
+            n_channels=30,
+            scalings="auto",
+            show=True,
+            block=True,
+            title="Manual artifact review for ICA: resolve REVIEW to BAD or KEEP",
+        )
+        if not original_bads.issubset(reviewed_raw.info["bads"]):
+            raise ValueError("Removing pre-reference bad channels requires rerunning preprocessing from the BIDS input.")
+        irrelevant = [
+            i for i,
+            scope in enumerate(reviewed_raw.annotations.ch_names) if scope and set(scope).issubset(reviewed_raw.info["bads"]) and str(reviewed_raw.annotations.description[i]).casefold().startswith((
+                "bad",
+                "review"
+            ))
+        ]
+        reviewed_raw.annotations.delete(irrelevant)
+        unresolved = [
+            str(desc)
+            for desc in reviewed_raw.annotations.description
+            if str(desc).casefold().startswith("review")
+        ]
+        scoped_bad = [
+            str(desc) for desc,
+            scope in zip(
+                reviewed_raw.annotations.description,
+                reviewed_raw.annotations.ch_names
+            ) if scope and str(desc).casefold().startswith("bad")
+        ]
+        if unresolved or scoped_bad:
+            print(f"Pending REVIEW: {len(unresolved)}; channel-scoped BAD: {len(scoped_bad)}. " f"Resolve REVIEW to KEEP/global BAD, or mark the affected channel bad. Reopening review.")
+            continue
+        break
+
     annotations = reviewed_raw.annotations
 
     # Save a detailed annotation table
@@ -1420,20 +1368,17 @@ def manual_review_artifacts(
         )
     ):
         # Exclude original task event annotations
-        if not str(description).upper().startswith(
-            ("BAD", "REVIEW", "KEEP")
-        ):
+        if not str(description).upper().startswith(("BAD", "REVIEW", "KEEP")):
             continue
         records.append({
             "annotation_index": i,
             "start": float(onset - reviewed_raw.first_time),
-            "end": float(
-                onset - reviewed_raw.first_time + duration
-            ),
+            "end": float( onset - reviewed_raw.first_time + duration ),
             "duration": float(duration),
             "label": str(description),
             "exclude_from_ica": str(description).lower().startswith("bad"),
         })
+
     review_report = pd.DataFrame(
         records,
         columns=[
@@ -1446,6 +1391,7 @@ def manual_review_artifacts(
         ],
     )
 
+    review_report["manual_review_performed"] = mode.semi_auto
     label_counts = Counter(review_report["label"])
 
     bad_intervals = [
@@ -1455,23 +1401,16 @@ def manual_review_artifacts(
     ]
 
     # Merge overlapping BAD intervals to avoid double counting
-    merged_bad = merge_intervals(
-        bad_intervals,
-        gap=0.0,
-        min_duration=0.0,
-    )
+    merged_bad = merge_intervals(bad_intervals, gap=0.0, min_duration=0.0)
 
-    bad_duration = sum(
-        end - start
-        for start, end in merged_bad
-    )
+    bad_duration = sum(end - start for start, end in merged_bad)
 
     summary = {
+        "manual_review_performed": mode.semi_auto,
+        "pending_review_intervals": int(review_report["label"].str.casefold().str.startswith("review").sum()),
         "total_annotations": len(review_report),
         "label_counts": dict(label_counts),
-        "bad_annotations": int(
-            review_report["exclude_from_ica"].sum()
-        ),
+        "bad_annotations": int(review_report["exclude_from_ica"].sum()),
         "bad_intervals": len(merged_bad),
         "bad_duration_sec": float(bad_duration),
         "bad_duration_percent": float(
@@ -1481,41 +1420,58 @@ def manual_review_artifacts(
 
     return reviewed_raw, review_report, summary
 
-def main(
-        raw: mne.io.BaseRaw,
-        p_id: str,
-        path_data: Path,
-        path_result: Path,
-) -> mne.io.BaseRaw:
 
-    cfg_channel = PeriodQCConfig()
+def review_for_ica(
+    raw: mne.io.BaseRaw,
+    p_id: str,
+    path_result: Path | str,
+) -> mne.io.BaseRaw:
+    """Use the same validated review and reference update for initial and repeated ICA."""
+    reviewed, report, summary = manual_review_artifacts(raw)
+
+    if set(reviewed.info["bads"]) != set(raw.info["bads"]):
+        from preprocess import ref_data
+        reviewed = ref_data(reviewed)
+
+    output = Path(path_result) / p_id
+    output.mkdir(parents=True, exist_ok=True)
+    pd.Series(summary).to_json(output / "artifact_summary_reviewed.json", indent=2)
+    report.to_csv(output / "artifact_results_reviewed.tsv", sep="\t", index=False)
+
+    return reviewed
+
+
+@timed_step("Artifact preparation")
+def main(
+    raw: mne.io.BaseRaw,
+    p_id: str,
+    path_data: Path,
+    path_result: Path,
+) -> mne.io.BaseRaw:
+    """Detect and review artifacts, export QC reports and save the pre-ICA EEG."""
+
+    # PeriodQCConfig is used before filtering in preprocess.main().
     cfg_detection = ICAPrep()
 
-    raw_period, report_period = detect_period_artifacts(raw, cfg_channel)
-    report_period.to_csv(
-        path_result/p_id/"bad_period_results.tsv",
-        sep="\t",
-        index=False,
-    )
+    raw_period = raw.copy()
+    # Period QC is performed once before filtering/reference by preprocess.main().
 
     annotated_detection, report, summary = (
-        semi_auto_ica_cleaning(
-            raw_period,
-            cfg_detection,
-        )
+        semi_auto_ica_cleaning(raw_period, cfg_detection)
     )
-    raw_ica = raw_period.copy()
-    # Transfer annotations (same sample timeline)
-    raw_ica.set_annotations(
-        annotated_detection.annotations.copy()
+    raw_ica = annotated_detection.copy()
+    report.to_csv(
+        path_result / p_id / "artifact_results_automatic.tsv",
+        sep="	",
+        index=False,
+        na_rep="n/a"
+    )
+    pd.Series(summary).to_json(
+        path_result / p_id / "artifact_summary_automatic.json",
+        indent=2
     )
 
-    raw_reviewed, review_report, review_summary = manual_review_artifacts(raw_ica)
-    review_report.to_csv(
-        path_result/p_id/"artifact_results_reviewed.tsv",
-        sep="\t",
-        index=False,
-    )
+    raw_reviewed = review_for_ica(raw_ica, p_id, path_result)
     # Save EEG with reviewed annotations
     raw_reviewed.save(
         path_data/f"{p_id}_task_Flanker_eeg_before_ica.fif",
@@ -1523,8 +1479,6 @@ def main(
     )
 
     print("\nArtifact summary")
-    for key, value in review_summary.items():
-        print(f"{key}: {value}")
     print("\nLabel counts:")
     print(Counter(report["label"]))
 

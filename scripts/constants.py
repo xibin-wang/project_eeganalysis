@@ -1,15 +1,34 @@
-"""
-Constant variables for all other scripts
+"""Define shared paths, execution modes and scientific settings.
 
+Tasks:
+- Configure the report root, concurrency, review and rerun options.
+- Define period QC, filtering, artifact detection and ICA parameters.
+- Define response epochs, ERN ROI/window and statistical alpha.
+
+Inputs: Analyst-edited dataclass defaults or explicitly supplied values.
+
+Outputs: Configuration objects consumed and recorded by other modules.
+
+Usage: Import and instantiate the relevant dataclasses; no analysis is executed.
 """
+
+from __future__ import annotations
 
 from pathlib import Path
 from dataclasses import dataclass
 
 @dataclass(frozen=True)
+class ModeConfiguration:
+    semi_auto: bool = False
+    max_workers: int = 2
+    rebuild_bids: bool = False
+    force_reprocess: bool = False
+
+@dataclass(frozen=True)
 class PathConstants:
     SCRIPT_DIR: Path = Path(__file__).resolve().parent
     FOLDER_ROOT: Path = SCRIPT_DIR.parent
+    FOLDER_RESULT: Path = FOLDER_ROOT / "results"
 
 @dataclass(frozen=True)
 class FilterParameters:

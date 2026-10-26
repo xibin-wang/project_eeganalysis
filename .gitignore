@@ -14,3 +14,4 @@
 # Track the .gitignore file itself
 !/.gitignore
 !/README.md
+!/LICENSE
